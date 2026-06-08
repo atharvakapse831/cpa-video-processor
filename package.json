@@ -1,0 +1,11 @@
+{
+  "name": "cpa-video-processor",
+  "version": "1.0.0",
+  "description": "CPA Video Processing Lambda",
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.890.0",
+    "@supabase/supabase-js": "^2.57.4"
+  }
+}
