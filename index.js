@@ -12,7 +12,7 @@ const path = require("path");
 const https = require("https");
 const crypto = require("crypto");
 
-process.env.PATH = /opt/bin:${process.env.PATH};
+process.env.PATH ='/opt/bin:${process.env.PATH}';
 
 const s3 = new S3Client({ region: "ap-south-1" });
 const supabase = createClient(
