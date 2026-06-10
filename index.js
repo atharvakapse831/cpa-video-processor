@@ -23,32 +23,48 @@ const supabase = createClient(
 const BUCKET = process.env.S3_BUCKET || "cpacontentstream";
 const TMP = "/tmp";
 
+/**
+ * ✅ FIX: webhookController sends the FULL webhook URL already:
+ *   event.webhookUrl = "https://backend.render.com/api/videos/studio/webhook/video-ready"
+ *
+ * The old code was appending "/api/videos/studio/webhook/video-ready" again,
+ * producing a doubled path that always 404s.
+ * 
+ * Now we POST directly to webhookUrl as-is.
+ */
 async function callWebhook(webhookUrl, webhookSecret, jobId, status, manifestUrl = null, error = null) {
   if (!webhookUrl) return;
+
   const payload = JSON.stringify({ jobId, status, manifestUrl, error });
   const signature = webhookSecret
     ? crypto.createHmac("sha256", webhookSecret).update(payload).digest("hex")
     : null;
+
   return new Promise((resolve) => {
-    const url = new URL(`${webhookUrl}/api/videos/studio/webhook/video-ready`);
+    const url = new URL(webhookUrl); // ✅ use as-is — no extra path appended
+
     const options = {
       hostname: url.hostname,
-      path: url.pathname,
-      method: "POST",
+      port:     url.port || 443,
+      path:     url.pathname + url.search,  // preserve the full path
+      method:   "POST",
       headers: {
-        "Content-Type": "application/json",
+        "Content-Type":   "application/json",
         "Content-Length": Buffer.byteLength(payload),
         ...(signature && { "x-cpa-signature": signature }),
       },
     };
+
     const req = https.request(options, (res) => {
       console.log(`[${jobId}] Webhook → ${res.statusCode}`);
       resolve();
     });
+
     req.on("error", (err) => {
       console.error(`[${jobId}] Webhook failed:`, err.message);
-      resolve();
+      resolve(); // don't throw — Lambda already did its job
     });
+
     req.write(payload);
     req.end();
   });
@@ -87,8 +103,8 @@ async function uploadToS3(localPath, s3Key, contentType) {
   const body = fs.readFileSync(localPath);
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
-    Key: s3Key,
-    Body: body,
+    Key:    s3Key,
+    Body:   body,
     ContentType: contentType,
     CacheControl: contentType === "application/x-mpegURL"
       ? "no-cache"
@@ -139,11 +155,10 @@ exports.handler = async (event) => {
     return { statusCode: 400, body: JSON.stringify({ error: "No s3Key" }) };
   }
 
-  const bucketName = event.Records?.[0]?.s3?.bucket?.name || event.bucket || BUCKET;
-
-  const head = await s3.send(new HeadObjectCommand({ Bucket: bucketName, Key: s3Key }));
-  const jobId = head.Metadata?.job_id || event.jobId;
-  const webhookUrl = event.webhookUrl || process.env.WEBHOOK_URL;
+  const bucketName   = event.Records?.[0]?.s3?.bucket?.name || event.bucket || BUCKET;
+  const head         = await s3.send(new HeadObjectCommand({ Bucket: bucketName, Key: s3Key }));
+  const jobId        = head.Metadata?.job_id || event.jobId;
+  const webhookUrl   = event.webhookUrl   || process.env.WEBHOOK_URL;
   const webhookSecret = event.webhookSecret || process.env.WEBHOOK_SECRET;
 
   if (!jobId) {
@@ -153,7 +168,7 @@ exports.handler = async (event) => {
   const inputPath = path.join(TMP, `${jobId}_input.mp4`);
   const outputDir = path.join(TMP, `${jobId}_hls`);
 
-  console.log(`[${jobId}] Lambda started for: ${s3Key}`);
+  console.log(`[${jobId}] Lambda started — s3Key: ${s3Key}, webhookUrl: ${webhookUrl}`);
 
   try {
     const processStart = Date.now();
@@ -177,11 +192,12 @@ exports.handler = async (event) => {
     await logStage(jobId, "uploading_chunks", "completed", null, Date.now() - uploadStart);
 
     await s3.send(new DeleteObjectCommand({ Bucket: bucketName, Key: s3Key }));
-    console.log(`[${jobId}] Raw file deleted`);
+    console.log(`[${jobId}] Raw file deleted from S3`);
 
     await updateJobStatus(jobId, "READY", { manifest_url: manifestUrl });
     await logStage(jobId, "ready", "completed", manifestUrl, Date.now() - processStart);
 
+    // ✅ webhookUrl is already the full URL — callWebhook no longer appends a path
     await callWebhook(webhookUrl, webhookSecret, jobId, "ready", manifestUrl);
 
     cleanup(inputPath, outputDir);
@@ -203,3 +219,4 @@ exports.handler = async (event) => {
     };
   }
 };
+      
