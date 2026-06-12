@@ -1,88 +1,131 @@
+/**
+ * cpa-video-processor — Lambda
+ *
+ * Stateless media processor. Does exactly 4 things:
+ *   1. Download original MP4 from S3 (uploads/original/{job_id}.mp4)
+ *   2. Convert MP4 → HLS using FFmpeg
+ *   3. Upload HLS files to S3 (videos/YYYY/MM/{reel_id}/)
+ *   4. POST callback to backend with the CloudFront stream URL
+ *
+ * No Supabase access. No state. Backend is the single source of truth.
+ */
+
 const {
   S3Client,
-  PutObjectCommand,
   GetObjectCommand,
-  HeadObjectCommand,
+  PutObjectCommand,
   DeleteObjectCommand,
 } = require("@aws-sdk/client-s3");
-const { createClient } = require("@supabase/supabase-js");
 const { spawn } = require("child_process");
-const fs = require("fs");
-const path = require("path");
+const fs    = require("fs");
+const path  = require("path");
 const https = require("https");
 const crypto = require("crypto");
 
 process.env.PATH = `/opt/bin:${process.env.PATH}`;
 
-const s3 = new S3Client({ region: "ap-south-1" });
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
-
-const BUCKET = process.env.S3_BUCKET || "cpacontentstream";
+const s3  = new S3Client({ region: process.env.AWS_REGION || "ap-south-1" });
 const TMP = "/tmp";
 
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+async function downloadFromS3(bucket, key, localPath) {
+  const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const buffer = await streamToBuffer(res.Body);
+  fs.writeFileSync(localPath, buffer);
+  return buffer.length;
+}
+
+async function transcodeToHLS(inputPath, outputDir) {
+  fs.mkdirSync(outputDir, { recursive: true });
+  const indexPath = path.join(outputDir, "index.m3u8");
+
+  await new Promise((resolve, reject) => {
+    const ffmpeg = spawn("ffmpeg", [
+      "-i", inputPath,
+      "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+      "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+      "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+      "-hls_time", "4",
+      "-hls_playlist_type", "vod",
+      "-hls_segment_filename", path.join(outputDir, "seg%03d.ts"),
+      "-hls_flags", "independent_segments",
+      indexPath,
+    ]);
+
+    let stderr = "";
+    ffmpeg.stderr.on("data", d => { stderr += d.toString(); });
+
+    ffmpeg.on("close", code => {
+      if (code === 0) resolve();
+      else reject(new Error(`FFmpeg exited with code ${code}: ${stderr.slice(-300)}`));
+    });
+    ffmpeg.on("error", reject);
+  });
+
+  return indexPath;
+}
+
 /**
- * ✅ FIX: webhookController sends the FULL webhook URL already:
- *   event.webhookUrl = "https://backend.render.com/api/videos/studio/webhook/video-ready"
- *
- * The old code was appending "/api/videos/studio/webhook/video-ready" again,
- * producing a doubled path that always 404s.
- * 
- * Now we POST directly to webhookUrl as-is.
+ * Get video duration in seconds using ffprobe.
  */
-async function callWebhook(webhookUrl, webhookSecret, jobId, status, manifestUrl = null, error = null) {
-  if (!webhookUrl) return;
-
-  const payload = JSON.stringify({ jobId, status, manifestUrl, error });
-  const signature = webhookSecret
-    ? crypto.createHmac("sha256", webhookSecret).update(payload).digest("hex")
-    : null;
-
+async function getDuration(inputPath) {
   return new Promise((resolve) => {
-    const url = new URL(webhookUrl); // ✅ use as-is — no extra path appended
-
-    const options = {
-      hostname: url.hostname,
-      port:     url.port || 443,
-      path:     url.pathname + url.search,  // preserve the full path
-      method:   "POST",
-      headers: {
-        "Content-Type":   "application/json",
-        "Content-Length": Buffer.byteLength(payload),
-        ...(signature && { "x-cpa-signature": signature }),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      console.log(`[${jobId}] Webhook → ${res.statusCode}`);
-      resolve();
-    });
-
-    req.on("error", (err) => {
-      console.error(`[${jobId}] Webhook failed:`, err.message);
-      resolve(); // don't throw — Lambda already did its job
-    });
-
-    req.write(payload);
-    req.end();
+    let out = "";
+    const ffprobe = spawn("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      inputPath,
+    ]);
+    ffprobe.stdout.on("data", d => { out += d.toString(); });
+    ffprobe.on("close", () => resolve(parseFloat(out.trim()) || 0));
+    ffprobe.on("error", () => resolve(0));
   });
 }
 
-async function logStage(jobId, stage, status, message = null, durationMs = null) {
-  try {
-    await supabase.from("video_job_logs").insert({
-      job_id: jobId, stage, status, message, duration_ms: durationMs,
-    });
-    console.log(`[${jobId}] ${stage} → ${status}${message ? `: ${message}` : ""}`);
-  } catch (err) {
-    console.error(`[${jobId}] Log failed:`, err.message);
-  }
+/**
+ * Writes master.m3u8 — a single-quality master playlist pointing at index.m3u8.
+ * Frontend always loads master.m3u8 so adding more qualities later requires
+ * no frontend changes.
+ */
+function writeMasterPlaylist(outputDir, bandwidth = 2500000, resolution = "1080x1920") {
+  const masterPath = path.join(outputDir, "master.m3u8");
+  const content = [
+    "#EXTM3U",
+    `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution}`,
+    "index.m3u8",
+    "",
+  ].join("\n");
+  fs.writeFileSync(masterPath, content);
+  return masterPath;
 }
 
-async function updateJobStatus(jobId, status, extra = {}) {
-  await supabase.from("video_jobs").update({ status, ...extra }).eq("id", jobId);
+async function uploadDirToS3(localDir, bucket, s3Prefix) {
+  const files = fs.readdirSync(localDir);
+  for (const file of files) {
+    const localPath = path.join(localDir, file);
+    const key = `${s3Prefix}${file}`;
+    const contentType = file.endsWith(".m3u8")
+      ? "application/x-mpegURL"
+      : "video/mp2t";
+
+    await s3.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: fs.readFileSync(localPath),
+      ContentType: contentType,
+      CacheControl: file.endsWith(".m3u8")
+        ? "no-cache"
+        : "max-age=31536000, immutable",
+    }));
+  }
 }
 
 function cleanup(...paths) {
@@ -93,130 +136,131 @@ function cleanup(...paths) {
   }
 }
 
-async function streamToBuffer(stream) {
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks);
-}
+/**
+ * POSTs the result to the backend's callback_url with a Bearer token.
+ * Does not throw — logs and returns on failure since Lambda has already
+ * done its job; the backend can retry/poll if needed.
+ */
+async function postCallback(callbackUrl, callbackToken, payload) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const url = new URL(callbackUrl);
 
-async function uploadToS3(localPath, s3Key, contentType) {
-  const body = fs.readFileSync(localPath);
-  await s3.send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key:    s3Key,
-    Body:   body,
-    ContentType: contentType,
-    CacheControl: contentType === "application/x-mpegURL"
-      ? "no-cache"
-      : "max-age=31536000, immutable",
-  }));
-}
+    const options = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        ...(callbackToken ? { Authorization: `Bearer ${callbackToken}` } : {}),
+      },
+    };
 
-async function transcodeToHLS(inputPath, outputDir) {
-  fs.mkdirSync(outputDir, { recursive: true });
-  const playlistPath = path.join(outputDir, "playlist.m3u8");
-  await new Promise((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", [
-      "-i", inputPath,
-      "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-      "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-      "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-      "-hls_time", "4",
-      "-hls_playlist_type", "vod",
-      "-hls_segment_filename", path.join(outputDir, "segment%03d.ts"),
-      "-hls_flags", "independent_segments",
-      playlistPath,
-    ]);
-    ffmpeg.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`FFmpeg exited with code ${code}`));
+    const req = https.request(options, res => {
+      console.log(`[${payload.job_id}] Callback → ${res.statusCode}`);
+      resolve();
     });
-    ffmpeg.on("error", reject);
+    req.on("error", err => {
+      console.error(`[${payload.job_id}] Callback failed:`, err.message);
+      resolve();
+    });
+    req.write(body);
+    req.end();
   });
-  return playlistPath;
 }
 
-async function uploadHLSToS3(outputDir, jobId) {
-  const files = fs.readdirSync(outputDir);
-  for (const file of files) {
-    const s3Key = `hls/${jobId}/${file}`;
-    const contentType = file.endsWith(".m3u8") ? "application/x-mpegURL" : "video/mp2t";
-    await uploadToS3(path.join(outputDir, file), s3Key, contentType);
-  }
-  return `https://${BUCKET}.s3.ap-south-1.amazonaws.com/hls/${jobId}/playlist.m3u8`;
-}
+// ── Handler ─────────────────────────────────────────────────────────────
 
 exports.handler = async (event) => {
-  const s3Key = event.Records?.[0]?.s3?.object?.key
-    ? decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, " "))
-    : event.s3Key;
+  const {
+    job_id,
+    reel_id,
+    bucket,
+    input_key,
+    callback_url,
+    callback_token,
+    cloudfront_domain,
+  } = event;
 
-  if (!s3Key) {
-    return { statusCode: 400, body: JSON.stringify({ error: "No s3Key" }) };
+  if (!job_id || !reel_id || !bucket || !input_key || !callback_url) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: "job_id, reel_id, bucket, input_key, callback_url required" }),
+    };
   }
 
-  const bucketName   = event.Records?.[0]?.s3?.bucket?.name || event.bucket || BUCKET;
-  const head         = await s3.send(new HeadObjectCommand({ Bucket: bucketName, Key: s3Key }));
-  const jobId        = head.Metadata?.job_id || event.jobId;
-  const webhookUrl   = event.webhookUrl   || process.env.WEBHOOK_URL;
-  const webhookSecret = event.webhookSecret || process.env.WEBHOOK_SECRET;
+  const cdnDomain = cloudfront_domain || process.env.CLOUDFRONT_DOMAIN || "cdn.codeplusacademy.in";
 
-  if (!jobId) {
-    return { statusCode: 400, body: JSON.stringify({ error: "No job_id" }) };
-  }
+  const inputPath = path.join(TMP, `${job_id}_input.mp4`);
+  const outputDir = path.join(TMP, `${job_id}_hls`);
 
-  const inputPath = path.join(TMP, `${jobId}_input.mp4`);
-  const outputDir = path.join(TMP, `${jobId}_hls`);
-
-  console.log(`[${jobId}] Lambda started — s3Key: ${s3Key}, webhookUrl: ${webhookUrl}`);
+  console.log(`[${job_id}] Started — input: s3://${bucket}/${input_key}`);
 
   try {
-    const processStart = Date.now();
-    await updateJobStatus(jobId, "PROCESSING");
-    await logStage(jobId, "processing", "started", `S3 key: ${s3Key}`);
+    // ── Step 1: Download original from S3 ─────────────────────────────
+    const bytes = await downloadFromS3(bucket, input_key, inputPath);
+    console.log(`[${job_id}] Downloaded ${(bytes / 1024 / 1024).toFixed(2)}MB`);
 
-    const res = await s3.send(new GetObjectCommand({ Bucket: bucketName, Key: s3Key }));
-    const buffer = await streamToBuffer(res.Body);
-    fs.writeFileSync(inputPath, buffer);
-    await logStage(jobId, "processing", "downloaded", `${(buffer.length / 1024 / 1024).toFixed(2)}MB`);
-
-    const chunkStart = Date.now();
-    await updateJobStatus(jobId, "CHUNKING");
-    await logStage(jobId, "chunking", "started");
+    // ── Step 2: FFmpeg → HLS ────────────────────────────────────────────
     await transcodeToHLS(inputPath, outputDir);
-    await logStage(jobId, "chunking", "completed", null, Date.now() - chunkStart);
+    writeMasterPlaylist(outputDir);
+    const duration = await getDuration(inputPath);
+    console.log(`[${job_id}] Transcoded — duration: ${duration}s`);
 
-    const uploadStart = Date.now();
-    await logStage(jobId, "uploading_chunks", "started");
-    const manifestUrl = await uploadHLSToS3(outputDir, jobId);
-    await logStage(jobId, "uploading_chunks", "completed", null, Date.now() - uploadStart);
+    // ── Step 3: Upload HLS to videos/YYYY/MM/{reel_id}/ ────────────────
+    const now = new Date();
+    const yyyy = now.getUTCFullYear();
+    const mm   = String(now.getUTCMonth() + 1).padStart(2, "0");
+    const s3Prefix = `videos/${yyyy}/${mm}/${reel_id}/`;
 
-    await s3.send(new DeleteObjectCommand({ Bucket: bucketName, Key: s3Key }));
-    console.log(`[${jobId}] Raw file deleted from S3`);
+    await uploadDirToS3(outputDir, bucket, s3Prefix);
+    console.log(`[${job_id}] Uploaded HLS to s3://${bucket}/${s3Prefix}`);
 
-    await updateJobStatus(jobId, "READY", { manifest_url: manifestUrl });
-    await logStage(jobId, "ready", "completed", manifestUrl, Date.now() - processStart);
+    // Delete the original raw upload — no longer needed
+    await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: input_key }));
 
-    // ✅ webhookUrl is already the full URL — callWebhook no longer appends a path
-    await callWebhook(webhookUrl, webhookSecret, jobId, "ready", manifestUrl);
+    // ── Step 4: Notify backend ──────────────────────────────────────────
+    const masterPlaylistS3  = `s3://${bucket}/${s3Prefix}master.m3u8`;
+    const masterPlaylistUrl = `https://${cdnDomain}/${s3Prefix}master.m3u8`;
+
+    await postCallback(callback_url, callback_token, {
+      job_id,
+      reel_id,
+      status: "completed",
+      bucket,
+      s3_prefix: s3Prefix,
+      master_playlist_s3: masterPlaylistS3,
+      master_playlist_url: masterPlaylistUrl,
+      stream_url: masterPlaylistUrl,
+      duration,
+      processed_at: new Date().toISOString(),
+    });
 
     cleanup(inputPath, outputDir);
 
     return {
       statusCode: 200,
-      body: JSON.stringify({ success: true, jobId, manifestUrl }),
+      body: JSON.stringify({ success: true, job_id, reel_id, stream_url: masterPlaylistUrl }),
     };
 
   } catch (err) {
-    console.error(`[${jobId}] Failed:`, err.message);
-    await updateJobStatus(jobId, "FAILED", { error: err.message });
-    await logStage(jobId, "processing", "failed", err.message);
-    await callWebhook(webhookUrl, webhookSecret, jobId, "failed", null, err.message);
+    console.error(`[${job_id}] Failed:`, err.message);
+
+    await postCallback(callback_url, callback_token, {
+      job_id,
+      reel_id,
+      status: "failed",
+      error: err.message,
+      processed_at: new Date().toISOString(),
+    });
+
     cleanup(inputPath, outputDir);
+
     return {
       statusCode: 500,
-      body: JSON.stringify({ success: false, jobId, error: err.message }),
+      body: JSON.stringify({ success: false, job_id, reel_id, error: err.message }),
     };
   }
 };
-      
