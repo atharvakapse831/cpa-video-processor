@@ -1,15 +1,3 @@
-/**
- * cpa-video-processor — Lambda
- *
- * Stateless media processor. Does exactly 4 things:
- *   1. Download original MP4 from S3 (uploads/original/{job_id}.mp4)
- *   2. Convert MP4 → HLS using FFmpeg
- *   3. Upload HLS files to S3 (videos/YYYY/MM/{reel_id}/)
- *   4. POST callback to backend with the CloudFront stream URL
- *
- * No Supabase access. No state. Backend is the single source of truth.
- */
-
 const {
   S3Client,
   GetObjectCommand,
@@ -191,8 +179,6 @@ exports.handler = async (event) => {
     };
   }
 
-  const cdnDomain = cloudfront_domain || process.env.CLOUDFRONT_DOMAIN || "cdn.codeplusacademy.in";
-
   const inputPath = path.join(TMP, `${job_id}_input.mp4`);
   const outputDir = path.join(TMP, `${job_id}_hls`);
 
@@ -222,8 +208,9 @@ exports.handler = async (event) => {
     await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: input_key }));
 
     // ── Step 4: Notify backend ──────────────────────────────────────────
+    const region = process.env.AWS_REGION || "ap-south-1";
     const masterPlaylistS3  = `s3://${bucket}/${s3Prefix}master.m3u8`;
-    const masterPlaylistUrl = `https://${cdnDomain}/${s3Prefix}master.m3u8`;
+    const masterPlaylistUrl = `https://${bucket}.s3.${region}.amazonaws.com/${s3Prefix}master.m3u8`;
 
     await postCallback(callback_url, callback_token, {
       job_id,
